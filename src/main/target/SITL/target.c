@@ -57,6 +57,7 @@
 
 #include "target/SITL/sim/realFlight.h"
 #include "target/SITL/sim/xplane.h"
+#include "target/SITL/sim/machina.h"
 
 #include "target/SITL/serial_proxy.h"
 
@@ -94,6 +95,8 @@ static void printVersion(void) {
 static void cleanupAndExit(int code, bool shouldExit) {
     if (sitlSim == SITL_SIM_XPLANE) {
         simXPlaneClose();
+    } else if (sitlSim == SITL_SIM_MACHINA) {
+        simMachinaClose();
     } else if (sitlSim == SITL_SIM_REALFLIGHT) {
         simRealFlightClose();
     }
@@ -163,6 +166,14 @@ void systemInit(void) {
                 fprintf(stderr, "[SIM] Connection with X-Plane successfully established.\n");
             } else {
                 fprintf(stderr, "[SIM] Connection with X-PLane NOT established.\n");
+            }
+            break;
+        case SITL_SIM_MACHINA:
+            if (simMachinaInit(simIp, simPort, lockstepEnabled)) {
+                fprintf(stderr, "[SIM] machina native backend connected (%s).\n", lockstepEnabled ? "lockstep" : "wall clock");
+            } else {
+                fprintf(stderr, "[SIM] machina native backend NOT connected.\n");
+                exit(3);
             }
             break;
         default:
@@ -235,8 +246,8 @@ void printCmdLineOptions(void)
     printVersion();
     fprintf(stderr, "Avaiable options:\n");
     fprintf(stderr, "--path=[path]                  Path and filename of eeprom.bin. If not specified 'eeprom.bin' in program directory is used.\n");
-    fprintf(stderr, "--sim=[rf|xp]                  Simulator interface: rf = RealFligt, xp = XPlane. Example: --sim=rf\n");
-    fprintf(stderr, "--lockstep[=dt_us]             Lockstep: virtual time from process start, stepped by the simulator (xp) by dt_us (default 1000).\n");
+    fprintf(stderr, "--sim=[rf|xp|machina]          Simulator interface: rf = RealFligt, xp = XPlane, machina = machina's native binary backend. Example: --sim=rf\n");
+    fprintf(stderr, "--lockstep[=dt_us]             Lockstep: virtual time from process start, stepped by the simulator (machina, xp). xp steps by dt_us (default 1000); machina by each packet's step.\n");
     fprintf(stderr, "--simip=[ip]                   IP-Address oft the simulator host. If not specified localhost (127.0.0.1) is used.\n");
     fprintf(stderr, "--simport=[port]               Port oft the simulator host.\n");
     fprintf(stderr, "--useimu                       Use IMU sensor data from the simulator instead of using attitude data from the simulator directly (experimental, not recommended).\n");
@@ -292,6 +303,8 @@ void parseArguments(int argc, char *argv[])
                     sitlSim = SITL_SIM_REALFLIGHT;
                 } else if (strcmp(optarg, "xp") == 0){
                     sitlSim = SITL_SIM_XPLANE;
+                } else if (strcmp(optarg, "machina") == 0) {
+                    sitlSim = SITL_SIM_MACHINA;
                 } else {
                     fprintf(stderr, "[SIM] Unsupported simulator %s.\n", optarg);
                 }
@@ -397,9 +410,9 @@ void parseArguments(int argc, char *argv[])
         strcpy(simIp, "127.0.0.1");
     }
 
-    // Lockstep needs a simulator that steps the clock: X-Plane.
-    if (lockstepEnabled && sitlSim != SITL_SIM_XPLANE) {
-        fprintf(stderr, "[lockstep] --lockstep needs --sim=xp\n");
+    // Lockstep needs a simulator that steps the clock: the native machina backend or X-Plane.
+    if (lockstepEnabled && sitlSim != SITL_SIM_MACHINA && sitlSim != SITL_SIM_XPLANE) {
+        fprintf(stderr, "[lockstep] --lockstep needs --sim=machina or --sim=xp\n");
         exit(2);
     }
     lockstepMainThread = pthread_self();

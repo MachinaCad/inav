@@ -15,6 +15,8 @@ main_sources(SITL_SRC
     config/config_streamer_file.c
     drivers/serial_tcp.c
     drivers/serial_tcp.h
+    target/SITL/sim/machina.c
+    target/SITL/sim/machina.h
     target/SITL/sim/realFlight.c
     target/SITL/sim/realFlight.h
     target/SITL/sim/simHelper.c

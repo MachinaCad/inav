@@ -40,6 +40,12 @@
 #include "io/gps.h"
 #include "io/gps_private.h"
 
+static uint16_t fakeEph = 100;       // cm
+static uint16_t fakeEpv = 100;       // cm
+static uint16_t fakeHdop = 100;      // 0.01
+static bool fakeOnlyNewData = false;
+static bool fakeHasNewData = false;
+
 void gpsFakeRestart(void)
 {
     // NOP
@@ -47,7 +53,20 @@ void gpsFakeRestart(void)
 
 void gpsFakeHandle(void)
 {
+    // machina: a solution reaches navigation once, when it arrives, as from a real receiver.
+    if (fakeOnlyNewData && !fakeHasNewData) {
+        return;
+    }
+    fakeHasNewData = false;
     gpsProcessNewSolutionData(false);
+}
+
+void gpsFakeSetAccuracy(uint16_t ephCm, uint16_t epvCm, uint16_t hdop, bool onlyNewData)
+{
+    fakeEph = ephCm;
+    fakeEpv = epvCm;
+    fakeHdop = hdop;
+    fakeOnlyNewData = onlyNewData;
 }
 
 void gpsFakeSet(
@@ -64,7 +83,7 @@ void gpsFakeSet(
     time_t time)
 {
     gpsSolDRV.fixType = fixType;
-    gpsSolDRV.hdop = gpsSol.fixType == GPS_NO_FIX ? 9999 : 100;
+    gpsSolDRV.hdop = gpsSol.fixType == GPS_NO_FIX ? 9999 : fakeHdop;
     gpsSolDRV.numSat = numSat;
     
     gpsSolDRV.llh.lat = lat;
@@ -75,8 +94,8 @@ void gpsFakeSet(
     gpsSolDRV.velNED[X] = velNED_X;
     gpsSolDRV.velNED[Y] = velNED_Y;
     gpsSolDRV.velNED[Z] = velNED_Z;
-    gpsSolDRV.eph = 100;
-    gpsSolDRV.epv = 100;
+    gpsSolDRV.eph = fakeEph;
+    gpsSolDRV.epv = fakeEpv;
     gpsSolDRV.flags.validVelNE = true;
     gpsSolDRV.flags.validVelD = true;
     gpsSolDRV.flags.validEPE = true;
@@ -95,6 +114,7 @@ void gpsFakeSet(
     }
     
     gpsProcessNewDriverData();
+    fakeHasNewData = true;
 }
    
 #endif

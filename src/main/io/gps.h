@@ -180,6 +180,9 @@ int getGpsBaudrate(void);
 int gpsBaudRateToInt(gpsBaudRate_e baudrate);
 
 #if defined(USE_GPS_FAKE)
+// machina: the accuracy the fake receiver reports, and whether navigation sees each solution
+// once (true) or at every GPS task run (false, INAV's default).
+void gpsFakeSetAccuracy(uint16_t ephCm, uint16_t epvCm, uint16_t hdop, bool onlyNewData);
 void gpsFakeSet(
     gpsFixType_e fixType,
     uint8_t numSat,

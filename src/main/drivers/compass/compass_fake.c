@@ -30,8 +30,11 @@
 #include "drivers/compass/compass.h"
 #include "drivers/compass/compass_fake.h"
 
+#include "fc/machina_sim.h"
+
 
 static int16_t fakeMagData[XYZ_AXIS_COUNT];
+static bool fakeMagInBodyAxes = false;      // machina: fakeMagData holds FLU body counts
 
 static bool fakeMagInit(magDev_t *magDev)
 {
@@ -48,11 +51,25 @@ void fakeMagSet(int16_t x, int16_t y, int16_t z)
     fakeMagData[X] = x;
     fakeMagData[Y] = y;
     fakeMagData[Z] = z;
+    fakeMagInBodyAxes = false;
+}
+
+void fakeMagSetBody(int16_t x, int16_t y, int16_t z)
+{
+    fakeMagData[X] = x;
+    fakeMagData[Y] = y;
+    fakeMagData[Z] = z;
+    fakeMagInBodyAxes = true;
 }
 
 static bool fakeMagRead(magDev_t *magDev)
 {
-    UNUSED(magDev);
+    if (fakeMagInBodyAxes && !magDev->magAlign.useExternal) {
+        // The sensor's own axes, as a compass mounted with the configured alignment reads them:
+        // INAV's alignment then turns them back into the body axes.
+        machinaSimUnalign(fakeMagData, magDev->magAlign.onBoard, magDev->magADCRaw);
+        return true;
+    }
     magDev->magADCRaw[X] = fakeMagData[X];
     magDev->magADCRaw[Y] = fakeMagData[Y];
     magDev->magADCRaw[Z] = fakeMagData[Z];

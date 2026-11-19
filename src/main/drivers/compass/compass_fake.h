@@ -20,3 +20,5 @@
 struct mag_s;
 bool fakeMagDetect(struct magDev_s *mag);
 void fakeMagSet(int16_t x, int16_t y, int16_t z);
+// machina's native backend: the field in INAV's body axes (FLU); reads invert the mag alignment.
+void fakeMagSetBody(int16_t x, int16_t y, int16_t z);

@@ -19,8 +19,15 @@
 
 #include "drivers/accgyro/accgyro.h"
 
+#define FAKE_ACC_1G         9806        // counts per g (acc_1G)
+#define FAKE_GYRO_LSB_DPS   0.0625f     // deg/s per count (gyro scale)
+
 bool fakeAccDetect(accDev_t *acc);
 void fakeAccSet(int16_t x, int16_t y, int16_t z);
+// machina's native backend: specific force in g, neither clipped nor quantised.
+void fakeAccSetG(float x, float y, float z);
 
 bool fakeGyroDetect(gyroDev_t *gyro);
 void fakeGyroSet(int16_t x, int16_t y, int16_t z);
+// machina's native backend: rates in deg/s, neither clipped nor quantised.
+void fakeGyroSetDps(float x, float y, float z);
