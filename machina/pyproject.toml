@@ -1,0 +1,12 @@
+# machina's harness for this INAV fork (machina/README.md). Not a package: run from this folder.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["firmware: runs this fork's SITL binary"]
