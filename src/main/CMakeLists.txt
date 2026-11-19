@@ -299,6 +299,8 @@ main_sources(COMMON_SRC
     fc/fc_msp_box.c
     fc/machina_sim.c
     fc/machina_sim.h
+    fc/machina_sim_outputs.c
+    fc/machina_sim_outputs.h
     fc/fc_msp_box.h
     fc/firmware_update.c
     fc/firmware_update.h

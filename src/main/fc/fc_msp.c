@@ -67,6 +67,7 @@
 #include "fc/control_profile.h"
 #include "fc/fc_msp.h"
 #include "fc/fc_msp_box.h"
+#include "fc/machina_sim_outputs.h"
 #include "fc/firmware_update.h"
 #include "fc/rc_adjustments.h"
 #include "fc/rc_controls.h"
@@ -4548,6 +4549,14 @@ bool mspFCProcessInOutCommand(uint16_t cmdMSP, sbuf_t *dst, sbuf_t *src, mspResu
     case MSP_SIMULATOR:
         *ret = mspProcessSimulatorCommand(dst, src, dataSize);
         break;
+    case MSP2_MACHINA_SIMULATOR: {
+        uint8_t reply[sizeof(machinaSimOutputFrame_t)];
+        machinaSimHitlProcess(sbufPtr(src), (int)dataSize, reply);
+        sbufAdvance(src, dataSize);
+        sbufWriteData(dst, reply, sizeof(reply));
+        *ret = MSP_RESULT_ACK;
+        break;
+    }
 #endif
 #ifndef SITL_BUILD
     case MSP2_INAV_TIMER_OUTPUT_MODE:

@@ -313,7 +313,7 @@ static void updateBatteryVoltage(timeUs_t timeDelta, bool justConnected)
 
 #ifdef USE_SIMULATOR
     if (ARMING_FLAG(SIMULATOR_MODE_HITL) && SIMULATOR_HAS_OPTION(HITL_SIMULATE_BATTERY)) {
-        vbat = ((uint16_t)simulatorData.vbat)*10;
+        vbat = simulatorData.machinaFrame ? simulatorData.vbatCv : ((uint16_t)simulatorData.vbat)*10;
         return;
     }
 #endif
@@ -637,7 +637,7 @@ void currentMeterUpdate(timeUs_t timeDelta)
 
 #ifdef USE_SIMULATOR
     if (ARMING_FLAG(SIMULATOR_MODE_HITL) && SIMULATOR_HAS_OPTION(HITL_CURRENT_SENSOR)) {
-        amperage = ((uint16_t)simulatorData.current) * 10;
+        amperage = simulatorData.machinaFrame ? simulatorData.currentCa : ((uint16_t)simulatorData.current) * 10;
     }
 #endif
 

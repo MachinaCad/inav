@@ -56,6 +56,7 @@
 #include "drivers/pitotmeter/pitotmeter_fake.h"
 #include "drivers/time.h"
 #include "fc/machina_sim.h"
+#include "fc/machina_sim_outputs.h"
 #include "fc/runtime_config.h"
 #include "flight/failsafe.h"
 #include "flight/imu.h"
@@ -117,38 +118,12 @@ static uint64_t clockNs(void)
 static void fillOutputs(machinaSimOutputFrame_t *o, uint64_t seq, uint64_t tNs)
 {
     memset(o, 0, sizeof(*o));
+    machinaSimFillOutputs(o);
     o->flags = lockstep ? MACHINA_SIM_OUT_LOCKSTEP : 0;
     o->seq = seq;
     o->tNs = tNs;
     o->clockNs = clockNs();
     o->applied = applied;
-    const uint8_t motors = getMotorCount();
-    o->motorCount = motors < MACHINA_SIM_MAX_MOTORS ? motors : MACHINA_SIM_MAX_MOTORS;
-    o->servoCount = MACHINA_SIM_MAX_SERVOS;
-    o->failsafePhase = (uint8_t)failsafePhase();
-    for (int i = 0; i < MACHINA_SIM_MAX_MOTORS; i++) {
-        o->motorRaw[i] = i < o->motorCount ? (uint16_t)motor[i] : 0;
-        o->motor[i] = i < o->motorCount ? ((int)motor[i] - 1000) / 1000.0f : 0.0f;
-    }
-    for (int i = 0; i < MACHINA_SIM_MAX_SERVOS; i++) {
-        o->servoRaw[i] = (uint16_t)servo[i];
-    }
-    for (int i = 0; i < 3; i++) {
-        o->attitudeDecideg[i] = attitude.raw[i];
-        o->ratesDps[i] = gyro.gyroADCf[i];
-        o->posNeuCm[i] = getEstimatedActualPosition(i);
-        o->velNeuCms[i] = getEstimatedActualVelocity(i);
-        o->gyroRawDps[i] = gyro.gyroRaw[i];
-        o->accG[i] = acc.accADCf[i];
-        o->magAdc[i] = mag.magADC[i];
-    }
-    o->armingFlags = armingFlags;
-    o->flightModeFlags = flightModeFlags;
-    o->stateFlags = stateFlags;
-    o->navState = (uint32_t)NAV_Status.state;
-    o->baroPressurePa = baro.baroPressure;
-    o->gnssLatE7 = gpsSol.llh.lat;
-    o->gnssLonE7 = gpsSol.llh.lon;
 }
 
 static void sendOutputs(uint64_t seq, uint64_t tNs)

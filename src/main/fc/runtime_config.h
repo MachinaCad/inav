@@ -214,6 +214,9 @@ typedef struct {
     uint16_t rssi;
     uint16_t current;  // dA (deciamperes; * 10 = cA)
     uint16_t rangefinder; // cm
+    bool machinaFrame;    // machina's HITL frame (MSP2_MACHINA_SIMULATOR) drives the simulator
+    uint16_t vbatCv;      // machina: battery voltage, 0.01 V
+    uint16_t currentCa;   // machina: battery current, 0.01 A
 
 } simulatorData_t;
 
