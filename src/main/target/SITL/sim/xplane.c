@@ -59,6 +59,7 @@
 #include "sensors/battery_sensor_fake.h"
 #include "target.h"
 #include "target/SITL/sim/simHelper.h"
+#include "navigation/navigation.h"
 
 #define XP_PORT 49000
 #define XPLANE_JOYSTICK_AXIS_COUNT 8
@@ -319,6 +320,48 @@ static bool receiveSingleDref(dref_t in_dref, float* value)
     return false;
 }
 
+// p01d: one datagram per exchange with every motor output (the stock bridge
+// exports a single throttle) and INAV's own estimate, for multirotors.
+static uint32_t p01dRxCount = 0;
+
+static void sendInavState(void)
+{
+    uint8_t b[96];
+    int o = 5;
+    uint32_t u;
+    float f;
+    int16_t s;
+    uint8_t n = getMotorCount();
+    memcpy(b, "MOTR", 5);
+#define P01D_PUT(v) do { memcpy(b + o, &(v), sizeof(v)); o += sizeof(v); } while (0)
+    u = p01dRxCount; P01D_PUT(u);
+    u = (uint32_t)micros(); P01D_PUT(u);
+    P01D_PUT(n);
+    for (int i = 0; i < 8; i++) {
+        f = i < n ? PWM_TO_FLOAT_0_1(motor[i]) : 0.0f;
+        P01D_PUT(f);
+    }
+    for (int i = 0; i < 3; i++) {
+        s = attitude.raw[i];
+        P01D_PUT(s);
+    }
+    for (int i = 0; i < 3; i++) {
+        f = getEstimatedActualPosition(i);
+        P01D_PUT(f);
+    }
+    for (int i = 0; i < 3; i++) {
+        f = getEstimatedActualVelocity(i);
+        P01D_PUT(f);
+    }
+    u = armingFlags; P01D_PUT(u);
+    u = flightModeFlags; P01D_PUT(u);
+    u = (uint32_t)NAV_Status.state; P01D_PUT(u);
+#undef P01D_PUT
+    if (sendto(sockFd, (void*)b, o, 0, (struct sockaddr*)&serverAddr, serverAddrLen) < 0) {
+        connectionState = DISCONNECTED;
+    }
+}
+
 static void exchangeDataWithXPlane(void)
 {
     uint8_t buf[1024];
@@ -357,6 +400,7 @@ static void exchangeDataWithXPlane(void)
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[2]", 0);
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[3]", 0);
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[4]", 0);
+    sendInavState();
 
     recvLen = recvfrom(sockFd, buf, sizeof(buf), 0,
                        (struct sockaddr*)&remoteAddr, &slen);
@@ -566,9 +610,9 @@ static void exchangeDataWithXPlane(void)
         (int32_t)roundf(longitude * 10000000),
         (int32_t)roundf(elevation * 100),
         (int16_t)roundf(groundspeed * 100), (int16_t)roundf(hpath * 10),
-        0,  //(int16_t)roundf(-local_vz * 100),
-        0,  //(int16_t)roundf(local_vx * 100),
-        0,  //(int16_t)roundf(-local_vy * 100),
+        (int16_t)roundf(-local_vz * 100),
+        (int16_t)roundf(local_vx * 100),
+        (int16_t)roundf(-local_vy * 100),
         0
     );
 
@@ -643,6 +687,7 @@ static void exchangeDataWithXPlane(void)
         );
     }
 
+    p01dRxCount++;
     unlockMainPID();
 }
 

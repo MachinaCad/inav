@@ -244,7 +244,7 @@ void onNewGPSData(void)
                 float gpsScaleLonDown = constrainf(cos_approx((ABS(gpsSol.llh.lat) / 10000000.0f) * 0.0174532925f), 0.01f, 1.0f);
                 /* SITL (X-Plane DataRef) passes zero velNED — use coordinate-difference velocity instead.
                  * MSP HITL explicitly injects real velNED via readMspSimulatorValues, so let it through. */
-                if (!ARMING_FLAG(SIMULATOR_MODE_SITL) && gpsSol.flags.validVelNE) {
+                if (gpsSol.flags.validVelNE) {
                     posEstimator.gps.vel.x = gpsSol.velNED[X];
                     posEstimator.gps.vel.y = gpsSol.velNED[Y];
                 }
