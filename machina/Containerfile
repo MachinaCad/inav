@@ -1,0 +1,9 @@
+# Build and test environment for machina's INAV fork (GPL-3.0 firmware, built from this tree).
+# The base and packages are those of machina's G0 probe P1d (spikes/cl_p01d_inav/Containerfile);
+# the SITL binary built here also runs natively on an Ubuntu 24.04 host.
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      cmake ninja-build ruby gcc g++ make python3 python3-yaml git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
