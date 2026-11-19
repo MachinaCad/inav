@@ -44,7 +44,7 @@ unit)
   [ $# -gt 0 ] && FILTER="-R '$(echo "$*" | tr ' ' '|')'"
   run "cmake -S /src -B /out/build-unit -DTOOLCHAIN= -GNinja >/out/build-unit.log 2>&1 \
        && ninja -C /out/build-unit -j$JOBS >>/out/build-unit.log 2>&1 \
-       && cd /out/build-unit && ctest --output-on-failure $FILTER >/out/ctest.log 2>&1; s=\$?; \
+       && cd /out/build-unit/src/test && ctest --output-on-failure $FILTER >/out/ctest.log 2>&1; s=\$?; \
        tail -25 /out/ctest.log 2>/dev/null || tail -40 /out/build-unit.log; exit \$s"
   ;;
 *)
