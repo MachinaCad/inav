@@ -295,6 +295,9 @@ void FAST_CODE NOINLINE scheduler(void)
     totalWaitingTasks += waitingTasks;
 
     currentTask = selectedTask;
+#if defined(SITL_BUILD)
+    const bool sitlNothingDue = (selectedTask == NULL);
+#endif
 
     if (selectedTask) {
         // Found a task that should be run
@@ -324,6 +327,15 @@ void FAST_CODE NOINLINE scheduler(void)
 
 #if defined(SITL_BUILD)
     {
+        if (sitlLockstepActive()) {
+            if (sitlNothingDue) {
+                sitlLockstepIdle(currentTimeUs);
+            }
+            return;
+        }
+        if (sitlLockstepEnabled()) {
+            sitlLockstepMainLoopTick();
+        }
         // Avoid busy-waiting and burning 100% CPU in SITL.  After executing the
         // current task (or finding nothing to do), sleep until just before the
         // next task is due.  For event-driven tasks (checkFunc) we limit the

@@ -70,6 +70,16 @@ char _Min_Stack_Size = 0;
 static pthread_mutex_t mainLoopLock;
 static SitlSim_e sitlSim = SITL_SIM_NONE;
 static struct timespec start_time;
+
+// p01d lockstep: virtual time advanced by the simulator, one fixed step per sensor packet.
+static bool lockstepEnabled = false;
+static uint32_t lockstepDtUs = 1000;
+static bool lockstepActive = false;
+static bool lockstepIdle = false;
+static bool lockstepMainLoopStarted = false;
+static timeUs_t lockstepNowUs = 0;
+static pthread_mutex_t lockstepMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lockstepCond = PTHREAD_COND_INITIALIZER;
 static uint8_t pwmMapping[MAX_MOTORS + MAX_SERVOS];
 static uint8_t mappingCount = 0;
 static bool useImu = false;
@@ -268,6 +278,7 @@ void parseArguments(int argc, char *argv[])
             {"parity", required_argument, 0, '4'},
             {"fcproxy", no_argument, 0, '5'},
             {"tcpbaseport", required_argument, 0, '6'},
+            {"lockstep", optional_argument, 0, 'l'},
             {NULL, 0, NULL, 0}
         };
 
@@ -295,6 +306,12 @@ void parseArguments(int argc, char *argv[])
                 break;
             case 'p':
                 simPort = atoi(optarg);
+                break;
+            case 'l':
+                lockstepEnabled = true;
+                if (optarg) {
+                    lockstepDtUs = (uint32_t)atoi(optarg);
+                }
                 break;
             case 'u':
                 useImu = true;
@@ -387,11 +404,65 @@ void unlockMainPID(void)
 }
 
 // Replacements for system functions
-timeUs_t micros(void) {
+static timeUs_t realMicros(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
     return (now.tv_sec - start_time.tv_sec) * 1000000 + (now.tv_nsec - start_time.tv_nsec) / 1000;
+}
+
+timeUs_t micros(void) {
+    if (__atomic_load_n(&lockstepActive, __ATOMIC_ACQUIRE)) {
+        return __atomic_load_n(&lockstepNowUs, __ATOMIC_ACQUIRE);
+    }
+    return realMicros();
+}
+
+bool sitlLockstepEnabled(void) { return lockstepEnabled; }
+
+bool sitlLockstepActive(void) { return __atomic_load_n(&lockstepActive, __ATOMIC_ACQUIRE); }
+
+// Simulator thread, after a sensor packet is applied: advance time, then wait
+// until the main loop has run every task due at the new time.
+void sitlLockstepAdvance(void)
+{
+    // Free-run until the main loop reaches the scheduler: init blocks on the connection.
+    if (!__atomic_load_n(&lockstepMainLoopStarted, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    pthread_mutex_lock(&lockstepMutex);
+    if (!lockstepActive) {
+        __atomic_store_n(&lockstepNowUs, realMicros(), __ATOMIC_RELEASE);
+        __atomic_store_n(&lockstepActive, true, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&lockstepNowUs, lockstepNowUs + lockstepDtUs, __ATOMIC_RELEASE);
+    }
+    lockstepIdle = false;
+    pthread_cond_broadcast(&lockstepCond);
+    while (!lockstepIdle) {
+        pthread_cond_wait(&lockstepCond, &lockstepMutex);
+    }
+    pthread_mutex_unlock(&lockstepMutex);
+}
+
+void sitlLockstepMainLoopTick(void)
+{
+    __atomic_store_n(&lockstepMainLoopStarted, true, __ATOMIC_RELEASE);
+}
+
+// Main loop, when a scheduler pass found nothing due: report idle, block until time advances.
+void sitlLockstepIdle(uint64_t seenUs)
+{
+    // Only idle if time has not advanced since the scheduler pass sampled it.
+    pthread_mutex_lock(&lockstepMutex);
+    if ((uint64_t)lockstepNowUs == seenUs) {
+        lockstepIdle = true;
+        pthread_cond_broadcast(&lockstepCond);
+        while ((uint64_t)lockstepNowUs == seenUs) {
+            pthread_cond_wait(&lockstepCond, &lockstepMutex);
+        }
+    }
+    pthread_mutex_unlock(&lockstepMutex);
 }
 
 uint64_t microsISR(void)

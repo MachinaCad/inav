@@ -199,6 +199,11 @@ typedef enum
 
 extern bool lockMainPID(void);
 extern void unlockMainPID(void);
+extern bool sitlLockstepEnabled(void);
+extern bool sitlLockstepActive(void);
+extern void sitlLockstepAdvance(void);
+extern void sitlLockstepIdle(uint64_t seenUs);
+extern void sitlLockstepMainLoopTick(void);
 extern void parseArguments(int argc, char *argv[]);
 extern char *strnstr(const char *s, const char *find, size_t slen);
 extern int lookupAddress (char *, int, int, struct sockaddr *, socklen_t*);

@@ -356,6 +356,7 @@ static void sendInavState(void)
     u = armingFlags; P01D_PUT(u);
     u = flightModeFlags; P01D_PUT(u);
     u = (uint32_t)NAV_Status.state; P01D_PUT(u);
+    uint8_t ls = sitlLockstepActive(); P01D_PUT(ls);
 #undef P01D_PUT
     if (sendto(sockFd, (void*)b, o, 0, (struct sockaddr*)&serverAddr, serverAddrLen) < 0) {
         connectionState = DISCONNECTED;
@@ -689,6 +690,9 @@ static void exchangeDataWithXPlane(void)
 
     p01dRxCount++;
     unlockMainPID();
+    if (sitlLockstepEnabled()) {
+        sitlLockstepAdvance();
+    }
 }
 
 static void* listenWorker(void* arg)
