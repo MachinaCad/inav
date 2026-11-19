@@ -171,6 +171,10 @@ typedef enum
     DREF_XITL_RSSI,
     DREF_XITL_FAILSAFE,
 
+    // machina lockstep: the bridge's packet number, in two 24-bit halves (exact in float32)
+    DREF_MACHINA_SEQ_LO,
+    DREF_MACHINA_SEQ_HI,
+
     DREF_LAST
 } dref_t;
 
@@ -323,10 +327,13 @@ static bool receiveSingleDref(dref_t in_dref, float* value)
 // p01d: one datagram per exchange with every motor output (the stock bridge
 // exports a single throttle) and INAV's own estimate, for multirotors.
 static uint32_t p01dRxCount = 0;
+static uint64_t machinaSeq = 0;           // last packet number the bridge sent (lockstep)
+static float machinaSeqLo = -1.0f;
+static float machinaSeqHi = -1.0f;
 
 static void sendInavState(void)
 {
-    uint8_t b[96];
+    uint8_t b[112];
     int o = 5;
     uint32_t u;
     float f;
@@ -357,19 +364,19 @@ static void sendInavState(void)
     u = flightModeFlags; P01D_PUT(u);
     u = (uint32_t)NAV_Status.state; P01D_PUT(u);
     uint8_t ls = sitlLockstepActive(); P01D_PUT(ls);
+    // machina: the echoed packet number and the virtual clock (ns since process start)
+    uint64_t q = machinaSeq; P01D_PUT(q);
+    q = sitlLockstepEnabled() ? sitlLockstepNowNs() : (uint64_t)micros() * 1000; P01D_PUT(q);
 #undef P01D_PUT
     if (sendto(sockFd, (void*)b, o, 0, (struct sockaddr*)&serverAddr, serverAddrLen) < 0) {
         connectionState = DISCONNECTED;
     }
 }
 
-static void exchangeDataWithXPlane(void)
-{
-    uint8_t buf[1024];
-    struct sockaddr_storage remoteAddr;
-    socklen_t slen = sizeof(remoteAddr);
-    int recvLen;
+static void applyXPlanePacket(const uint8_t *buf, int recvLen);
 
+static void sendXPlaneOutputs(void)
+{
     float motorValue = 0;
     float yokeValues[3] = {0};
     int y = 0;
@@ -402,6 +409,16 @@ static void exchangeDataWithXPlane(void)
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[3]", 0);
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[4]", 0);
     sendInavState();
+}
+
+static void exchangeDataWithXPlane(void)
+{
+    uint8_t buf[1024];
+    struct sockaddr_storage remoteAddr;
+    socklen_t slen = sizeof(remoteAddr);
+    int recvLen;
+
+    sendXPlaneOutputs();
 
     recvLen = recvfrom(sockFd, buf, sizeof(buf), 0,
                        (struct sockaddr*)&remoteAddr, &slen);
@@ -416,9 +433,17 @@ static void exchangeDataWithXPlane(void)
         return;
     }
 
-    for (int i = 5; i < recvLen; i += 8) {
-        dref_t dref = (dref_t)xint2uint32(&buf[i]);
-        float value = xflt2float(&(buf[i + 4]));
+    applyXPlanePacket(buf, recvLen);
+    p01dRxCount++;
+    unlockMainPID();
+}
+
+// Parse one RREF packet and hand its values to the simulated sensors.
+static void applyXPlanePacket(const uint8_t *buf, int recvLen)
+{
+    for (int i = 5; i + 8 <= recvLen; i += 8) {
+        dref_t dref = (dref_t)xint2uint32((uint8_t *)&buf[i]);
+        float value = xflt2float((uint8_t *)&(buf[i + 4]));
 
         switch (dref) {
             case DREF_LATITUDE:
@@ -577,6 +602,20 @@ static void exchangeDataWithXPlane(void)
                 failsafe = value >= 1 ? true : false;
                 break;
 
+            case DREF_XITL_DataRef_Version:
+                if (sitlLockstepEnabled()) {
+                    inavXitlDrefVersion = (int)value;
+                }
+                break;
+
+            case DREF_MACHINA_SEQ_LO:
+                machinaSeqLo = value;
+                break;
+
+            case DREF_MACHINA_SEQ_HI:
+                machinaSeqHi = value;
+                break;
+
             default:
                 break;
         }
@@ -688,16 +727,75 @@ static void exchangeDataWithXPlane(void)
         );
     }
 
-    p01dRxCount++;
-    unlockMainPID();
-    if (sitlLockstepEnabled()) {
-        sitlLockstepAdvance();
+}
+
+/*
+ * machina lockstep over the X-Plane interface (--sim=xp --lockstep[=dt_us]). The receive blocks
+ * with no timeout, so the firmware never steps on held sensors; every packet, the first one
+ * included, is one step of dt (no connection probe consumes a packet); the reply (DREFs and MOTR)
+ * follows the step. When the bridge numbers its packets (drefs DREF_MACHINA_SEQ_LO/HI), a gap or a
+ * repeat stops the firmware: it prints the error and exits with status 3.
+ */
+static void lockstepXPlaneWorker(void)
+{
+    uint8_t buf[1024];
+    struct sockaddr_storage remoteAddr;
+
+    registerCommonDrefs(0);
+    registerInavXitlDrefs(0);
+    registerXplaneDrefs(0);
+    registerCommonDrefs(100);
+    registerInavXitlDrefs(100);
+
+    while (connectionState != DISCONNECTED) {
+        socklen_t slen = sizeof(remoteAddr);
+        const int recvLen = recvfrom(sockFd, buf, sizeof(buf), 0, (struct sockaddr*)&remoteAddr, &slen);
+        if (recvLen < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fprintf(stderr, "[SIM] X-Plane lockstep: receive failed (%s)\n", strerror(errno));
+            break;
+        }
+        if (recvLen < 5 || strncmp((char*)buf, "RREF", 4) != 0) {
+            fprintf(stderr, "[SIM] X-Plane lockstep: ignored a %d-byte datagram that is not RREF\n", recvLen);
+            continue;
+        }
+
+        sitlLockstepWaitParked();
+        machinaSeqLo = machinaSeqHi = -1.0f;
+        applyXPlanePacket(buf, recvLen);
+        if (machinaSeqLo >= 0.0f && machinaSeqHi >= 0.0f) {
+            const uint64_t seq = ((uint64_t)machinaSeqHi << 24) | (uint64_t)machinaSeqLo;
+            if (seq != p01dRxCount) {
+                fprintf(stderr, "[SIM] X-Plane lockstep: sequence error: packet %llu, expected %lu\n",
+                        (unsigned long long)seq, (unsigned long)p01dRxCount);
+                fflush(stderr);
+                _exit(3);
+            }
+            machinaSeq = seq;
+        }
+        if (connectionState != CONNECTED) {
+            ENABLE_ARMING_FLAG(SIMULATOR_MODE_SITL);
+            ENABLE_STATE(ACCELEROMETER_CALIBRATED);
+            connectionState = CONNECTED;
+        }
+        p01dRxCount++;
+        unlockMainPID();
+        sitlLockstepAdvanceTo(sitlLockstepNowNs() + sitlLockstepXplaneStepNs());
+        sendXPlaneOutputs();
     }
 }
 
 static void* listenWorker(void* arg)
 {
     UNUSED(arg);
+
+    if (sitlLockstepEnabled()) {
+        lockstepXPlaneWorker();
+        fprintf(stderr, "[SOCKET] X-Plane connection lost.\n");
+        return NULL;
+    }
 
     while (connectionState != DISCONNECTED) {
         connectionState_t cs = connectionState;
@@ -781,7 +879,8 @@ bool simXPlaneInit(char* ip, int port, uint8_t* mapping, uint8_t mapCount,
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
-    if (setsockopt(sockFd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval*)&tv, sizeof(struct timeval))) {
+    // Lockstep blocks on receive with no timeout: a timeout would step the firmware on held sensors.
+    if (!sitlLockstepEnabled() && setsockopt(sockFd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval*)&tv, sizeof(struct timeval))) {
         return false;
     }
 
@@ -794,7 +893,11 @@ bool simXPlaneInit(char* ip, int port, uint8_t* mapping, uint8_t mapCount,
     }
 
     while (connectionState != CONNECTED && connectionState != DISCONNECTED) {
-        delay(250);
+        if (sitlLockstepEnabled()) {
+            sitlLockstepIdle();     // parked until the first packet is applied
+        } else {
+            delay(250);
+        }
     }
 
     return connectionState == CONNECTED;

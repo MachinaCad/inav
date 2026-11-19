@@ -327,14 +327,12 @@ void FAST_CODE NOINLINE scheduler(void)
 
 #if defined(SITL_BUILD)
     {
-        if (sitlLockstepActive()) {
+        if (sitlLockstepEnabled()) {
+            // Virtual time: never sleep; park until the simulator's next step when nothing is due.
             if (sitlNothingDue) {
-                sitlLockstepIdle(currentTimeUs);
+                sitlLockstepIdle();
             }
             return;
-        }
-        if (sitlLockstepEnabled()) {
-            sitlLockstepMainLoopTick();
         }
         // Avoid busy-waiting and burning 100% CPU in SITL.  After executing the
         // current task (or finding nothing to do), sleep until just before the

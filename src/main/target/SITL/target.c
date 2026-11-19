@@ -71,13 +71,12 @@ static pthread_mutex_t mainLoopLock;
 static SitlSim_e sitlSim = SITL_SIM_NONE;
 static struct timespec start_time;
 
-// p01d lockstep: virtual time advanced by the simulator, one fixed step per sensor packet.
+// Lockstep: virtual time from process start, in integer nanoseconds (see sitlLockstep* below).
 static bool lockstepEnabled = false;
-static uint32_t lockstepDtUs = 1000;
-static bool lockstepActive = false;
-static bool lockstepIdle = false;
-static bool lockstepMainLoopStarted = false;
-static timeUs_t lockstepNowUs = 0;
+static uint64_t lockstepXplaneStepNs = 1000000;     // X-Plane only: --lockstep=dt_us, fixed
+static uint64_t lockstepNowNs = 0;                  // the virtual clock, ns since process start
+static bool lockstepMainParked = false;
+static pthread_t lockstepMainThread;
 static pthread_mutex_t lockstepMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t lockstepCond = PTHREAD_COND_INITIALIZER;
 static uint8_t pwmMapping[MAX_MOTORS + MAX_SERVOS];
@@ -237,6 +236,7 @@ void printCmdLineOptions(void)
     fprintf(stderr, "Avaiable options:\n");
     fprintf(stderr, "--path=[path]                  Path and filename of eeprom.bin. If not specified 'eeprom.bin' in program directory is used.\n");
     fprintf(stderr, "--sim=[rf|xp]                  Simulator interface: rf = RealFligt, xp = XPlane. Example: --sim=rf\n");
+    fprintf(stderr, "--lockstep[=dt_us]             Lockstep: virtual time from process start, stepped by the simulator (xp) by dt_us (default 1000).\n");
     fprintf(stderr, "--simip=[ip]                   IP-Address oft the simulator host. If not specified localhost (127.0.0.1) is used.\n");
     fprintf(stderr, "--simport=[port]               Port oft the simulator host.\n");
     fprintf(stderr, "--useimu                       Use IMU sensor data from the simulator instead of using attitude data from the simulator directly (experimental, not recommended).\n");
@@ -310,7 +310,12 @@ void parseArguments(int argc, char *argv[])
             case 'l':
                 lockstepEnabled = true;
                 if (optarg) {
-                    lockstepDtUs = (uint32_t)atoi(optarg);
+                    const long dtUs = atol(optarg);
+                    if (dtUs <= 0 || dtUs > 1000000) {
+                        fprintf(stderr, "[lockstep] Invalid step %s us\n", optarg);
+                        exit(2);
+                    }
+                    lockstepXplaneStepNs = (uint64_t)dtUs * 1000;
                 }
                 break;
             case 'u':
@@ -391,6 +396,13 @@ void parseArguments(int argc, char *argv[])
         simIp = malloc(10);
         strcpy(simIp, "127.0.0.1");
     }
+
+    // Lockstep needs a simulator that steps the clock: X-Plane.
+    if (lockstepEnabled && sitlSim != SITL_SIM_XPLANE) {
+        fprintf(stderr, "[lockstep] --lockstep needs --sim=xp\n");
+        exit(2);
+    }
+    lockstepMainThread = pthread_self();
 }
 
 
@@ -412,55 +424,80 @@ static timeUs_t realMicros(void) {
 }
 
 timeUs_t micros(void) {
-    if (__atomic_load_n(&lockstepActive, __ATOMIC_ACQUIRE)) {
-        return __atomic_load_n(&lockstepNowUs, __ATOMIC_ACQUIRE);
+    if (lockstepEnabled) {
+        return __atomic_load_n(&lockstepNowNs, __ATOMIC_ACQUIRE) / 1000;
     }
     return realMicros();
 }
 
+/*
+ * Lockstep (machina, closed-loop-plan.md D3).
+ *
+ * With --lockstep the firmware's clock is virtual from process start (t = 0) and advances only
+ * when the simulator thread applies a sensor packet; it never reads the host's clock. Each step
+ * runs in a fixed order: sensors(k), then the clock to the end of the step, then the main loop
+ * until nothing is due, then motors(k). The main thread runs only while the clock stands still,
+ * and the simulator thread changes the clock and the simulated sensors only while the main thread
+ * is parked: in the scheduler with no task due, or in delay(). Init is driven by sensor packets
+ * too: its delays park the main thread until enough steps have passed. Nothing in a run depends on
+ * when packets arrive, only on their contents and order.
+ */
 bool sitlLockstepEnabled(void) { return lockstepEnabled; }
 
-bool sitlLockstepActive(void) { return __atomic_load_n(&lockstepActive, __ATOMIC_ACQUIRE); }
+bool sitlLockstepActive(void) { return lockstepEnabled; }
 
-// Simulator thread, after a sensor packet is applied: advance time, then wait
-// until the main loop has run every task due at the new time.
-void sitlLockstepAdvance(void)
+uint64_t sitlLockstepNowNs(void) { return __atomic_load_n(&lockstepNowNs, __ATOMIC_ACQUIRE); }
+
+uint64_t sitlLockstepXplaneStepNs(void) { return lockstepXplaneStepNs; }
+
+static bool lockstepOnMainThread(void)
 {
-    // Free-run until the main loop reaches the scheduler: init blocks on the connection.
-    if (!__atomic_load_n(&lockstepMainLoopStarted, __ATOMIC_ACQUIRE)) {
-        return;
-    }
+    return lockstepEnabled && pthread_equal(pthread_self(), lockstepMainThread);
+}
+
+// Main thread: park until the virtual clock reaches targetNs.
+static void lockstepParkUntil(uint64_t targetNs)
+{
     pthread_mutex_lock(&lockstepMutex);
-    if (!lockstepActive) {
-        __atomic_store_n(&lockstepNowUs, realMicros(), __ATOMIC_RELEASE);
-        __atomic_store_n(&lockstepActive, true, __ATOMIC_RELEASE);
-    } else {
-        __atomic_store_n(&lockstepNowUs, lockstepNowUs + lockstepDtUs, __ATOMIC_RELEASE);
+    while (lockstepNowNs < targetNs) {
+        lockstepMainParked = true;
+        pthread_cond_broadcast(&lockstepCond);
+        pthread_cond_wait(&lockstepCond, &lockstepMutex);
     }
-    lockstepIdle = false;
-    pthread_cond_broadcast(&lockstepCond);
-    while (!lockstepIdle) {
+    lockstepMainParked = false;
+    pthread_mutex_unlock(&lockstepMutex);
+}
+
+// Main thread, from the scheduler when no task is due: park until the next step.
+void sitlLockstepIdle(void)
+{
+    pthread_mutex_lock(&lockstepMutex);
+    const uint64_t targetNs = lockstepNowNs + 1;
+    pthread_mutex_unlock(&lockstepMutex);
+    lockstepParkUntil(targetNs);
+}
+
+// Simulator thread, before it touches the sensors or the clock: wait until the main thread is
+// parked (at boot, until init reaches its first delay or the scheduler).
+void sitlLockstepWaitParked(void)
+{
+    pthread_mutex_lock(&lockstepMutex);
+    while (!lockstepMainParked) {
         pthread_cond_wait(&lockstepCond, &lockstepMutex);
     }
     pthread_mutex_unlock(&lockstepMutex);
 }
 
-void sitlLockstepMainLoopTick(void)
+// Simulator thread, after the sensors of a step are applied: move the clock to the end of the
+// step, then wait until the main loop has run everything due by then and parked again.
+void sitlLockstepAdvanceTo(uint64_t nowNs)
 {
-    __atomic_store_n(&lockstepMainLoopStarted, true, __ATOMIC_RELEASE);
-}
-
-// Main loop, when a scheduler pass found nothing due: report idle, block until time advances.
-void sitlLockstepIdle(uint64_t seenUs)
-{
-    // Only idle if time has not advanced since the scheduler pass sampled it.
     pthread_mutex_lock(&lockstepMutex);
-    if ((uint64_t)lockstepNowUs == seenUs) {
-        lockstepIdle = true;
-        pthread_cond_broadcast(&lockstepCond);
-        while ((uint64_t)lockstepNowUs == seenUs) {
-            pthread_cond_wait(&lockstepCond, &lockstepMutex);
-        }
+    __atomic_store_n(&lockstepNowNs, nowNs, __ATOMIC_RELEASE);
+    lockstepMainParked = false;
+    pthread_cond_broadcast(&lockstepCond);
+    while (!lockstepMainParked) {
+        pthread_cond_wait(&lockstepCond, &lockstepMutex);
     }
     pthread_mutex_unlock(&lockstepMutex);
 }
@@ -476,6 +513,11 @@ uint32_t millis(void) {
 
 void delayMicroseconds(timeUs_t us)
 {
+    if (lockstepOnMainThread()) {
+        // Virtual time: the main thread parks until the simulator has stepped past the delay.
+        lockstepParkUntil(sitlLockstepNowNs() + (uint64_t)us * 1000);
+        return;
+    }
     usleep(us);
 }
 

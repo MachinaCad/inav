@@ -256,7 +256,7 @@ static void updateArmingStatus(void)
         /* CHECK: CPU load */
         if (isSystemOverloaded()
 #ifdef SITL_BUILD
-            && !sitlLockstepActive() // p01d: in virtual time every scheduler pass has due tasks
+            && !sitlLockstepEnabled() // lockstep: in virtual time every scheduler pass has due tasks
 #endif
         ) {
             ENABLE_ARMING_FLAG(ARMING_DISABLED_SYSTEM_OVERLOADED);
