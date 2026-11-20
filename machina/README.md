@@ -60,6 +60,10 @@ frame k. The layouts are packed little-endian structs in `src/main/fc/machina_si
   position in 1e-7 deg and cm and velocity in cm/s, as from a u-blox receiver; the compass at 1024
   counts per 50 uT (finer than the usual compasses), saturating at 1.6 mT. Saturation and
   quantisation of the real parts belong to machina's sensor models, not to this interface.
+- **Compass calibration.** INAV weights its compass by how close the field's magnitude comes to
+  1024 counts after its calibration gains (`maggain_x/y/z`). A bridge sets the gains that
+  calibration would leave at the flight's site (`sitl.compass_calibration`): left at 50 uT's, a
+  25 uT site cuts the compass weight to e^-2 and the heading does not converge before arming.
 - **Timing.** Each slow sensor (compass, barometer, GNSS) is flagged new only at its own tick, and
   the fake GNSS hands each solution to navigation once, as a real receiver does (stock SITL feeds
   every GPS task run).
