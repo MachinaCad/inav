@@ -76,6 +76,8 @@ static struct timespec start_time;
 static bool lockstepEnabled = false;
 static uint64_t lockstepXplaneStepNs = 1000000;     // X-Plane only: --lockstep=dt_us, fixed
 static uint64_t lockstepNowNs = 0;                  // the virtual clock, ns since process start
+static uint64_t lockstepSteps = 0;                  // steps applied (sitlLockstepAdvanceTo)
+static bool lockstepDelaysInstant = false;          // the bridge's form: a delay takes no virtual time
 static bool lockstepMainParked = false;
 static pthread_t lockstepMainThread;
 static pthread_mutex_t lockstepMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -454,6 +456,12 @@ timeUs_t micros(void) {
  * is parked: in the scheduler with no task due, or in delay(). Init is driven by sensor packets
  * too: its delays park the main thread until enough steps have passed. Nothing in a run depends on
  * when packets arrive, only on their contents and order.
+ *
+ * The bridge's form of the X-Plane path (w1-s7-inav-bridge; xplane.c, packets that carry their
+ * tick) sets the clock to each packet's tick, so packet 0 at tick 0 is a step that leaves the clock
+ * where it is: a step wakes the parked main loop whether or not the clock moves. In that form a
+ * delay takes no virtual time (sitlLockstepSetDelaysInstant): init runs whole at the first
+ * packet's tick, and reply 0 already comes from the main loop, as the bridge expects.
  */
 bool sitlLockstepEnabled(void) { return lockstepEnabled; }
 
@@ -481,13 +489,29 @@ static void lockstepParkUntil(uint64_t targetNs)
     pthread_mutex_unlock(&lockstepMutex);
 }
 
-// Main thread, from the scheduler when no task is due: park until the next step.
+// Main thread, from the scheduler when no task is due: park until the next step (a step that
+// moves the clock, or one that leaves it at the same tick).
 void sitlLockstepIdle(void)
 {
     pthread_mutex_lock(&lockstepMutex);
-    const uint64_t targetNs = lockstepNowNs + 1;
+    const uint64_t nowNs = lockstepNowNs;
+    const uint64_t steps = lockstepSteps;
+    while (lockstepNowNs == nowNs && lockstepSteps == steps) {
+        lockstepMainParked = true;
+        pthread_cond_broadcast(&lockstepCond);
+        pthread_cond_wait(&lockstepCond, &lockstepMutex);
+    }
+    lockstepMainParked = false;
     pthread_mutex_unlock(&lockstepMutex);
-    lockstepParkUntil(targetNs);
+}
+
+// Simulator thread, once a run's packets are known to be the bridge's form: from now on a delay on
+// the main thread takes no virtual time.
+void sitlLockstepSetDelaysInstant(bool instant)
+{
+    pthread_mutex_lock(&lockstepMutex);
+    lockstepDelaysInstant = instant;
+    pthread_mutex_unlock(&lockstepMutex);
 }
 
 // Simulator thread, before it touches the sensors or the clock: wait until the main thread is
@@ -507,6 +531,7 @@ void sitlLockstepAdvanceTo(uint64_t nowNs)
 {
     pthread_mutex_lock(&lockstepMutex);
     __atomic_store_n(&lockstepNowNs, nowNs, __ATOMIC_RELEASE);
+    lockstepSteps++;
     lockstepMainParked = false;
     pthread_cond_broadcast(&lockstepCond);
     while (!lockstepMainParked) {
@@ -527,6 +552,12 @@ uint32_t millis(void) {
 void delayMicroseconds(timeUs_t us)
 {
     if (lockstepOnMainThread()) {
+        pthread_mutex_lock(&lockstepMutex);
+        const bool instant = lockstepDelaysInstant;
+        pthread_mutex_unlock(&lockstepMutex);
+        if (instant) {
+            return;  // the bridge's form: virtual time stands still in a delay
+        }
         // Virtual time: the main thread parks until the simulator has stepped past the delay.
         lockstepParkUntil(sitlLockstepNowNs() + (uint64_t)us * 1000);
         return;

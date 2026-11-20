@@ -205,6 +205,7 @@ extern bool sitlLockstepActive(void);
 extern uint64_t sitlLockstepNowNs(void);
 extern uint64_t sitlLockstepXplaneStepNs(void);
 extern void sitlLockstepIdle(void);
+extern void sitlLockstepSetDelaysInstant(bool instant);
 extern void sitlLockstepWaitParked(void);
 extern void sitlLockstepAdvanceTo(uint64_t nowNs);
 extern void parseArguments(int argc, char *argv[]);

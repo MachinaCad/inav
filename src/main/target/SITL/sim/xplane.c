@@ -37,6 +37,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "common/maths.h"
@@ -60,6 +61,9 @@
 #include "target.h"
 #include "target/SITL/sim/simHelper.h"
 #include "navigation/navigation.h"
+#include "flight/failsafe.h"
+#include "sensors/gyro.h"
+#include "navigation/navigation_private.h"
 
 #define XP_PORT 49000
 #define XPLANE_JOYSTICK_AXIS_COUNT 8
@@ -171,9 +175,16 @@ typedef enum
     DREF_XITL_RSSI,
     DREF_XITL_FAILSAFE,
 
-    // machina lockstep: the bridge's packet number, in two 24-bit halves (exact in float32)
+    // machina: the packet's number. FW2's harness sends it in two 24-bit halves (42 low, 43 high);
+    // the bridge (w1-s7-inav-bridge) in two 16-bit words, with the packet's tick in integer ns in
+    // four 16-bit words (44 to 47, least significant first). Every value is exact in float32. A
+    // packet that carries its tick is the bridge's form (see machinaNumbering below).
     DREF_MACHINA_SEQ_LO,
     DREF_MACHINA_SEQ_HI,
+    DREF_MACHINA_T0,
+    DREF_MACHINA_T1,
+    DREF_MACHINA_T2,
+    DREF_MACHINA_T3,
 
     DREF_LAST
 } dref_t;
@@ -304,23 +315,28 @@ static bool receiveSingleDref(dref_t in_dref, float* value)
     socklen_t slen = sizeof(remoteAddr);
     int recvLen;
 
-    recvLen = recvfrom(sockFd, buf, sizeof(buf), 0, (struct sockaddr*)&remoteAddr, &slen);
+    // machina: the probe only peeks, so the packet that answers it is applied and counted as the
+    // first step (the bridge numbers packets from 0); a datagram it cannot use is consumed.
+    recvLen = recvfrom(sockFd, buf, sizeof(buf), MSG_PEEK, (struct sockaddr*)&remoteAddr, &slen);
     if (recvLen < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
         return false;
     }
-
-    if (recvLen < 5 || strncmp((char*)buf, "RREF", 4) != 0) {
+    if (recvLen < 0) {
         return false;
     }
 
-    for (int i = 5; i < recvLen; i += 8) {
-        dref_t dref = (dref_t)xint2uint32(&buf[i]);
-        if (dref == in_dref) {
-            *value = xflt2float(&(buf[i + 4]));
-            return true;
+    if (recvLen >= 5 && strncmp((char*)buf, "RREF", 4) == 0) {
+        for (int i = 5; i + 8 <= recvLen; i += 8) {
+            dref_t dref = (dref_t)xint2uint32(&buf[i]);
+            if (dref == in_dref) {
+                *value = xflt2float(&(buf[i + 4]));
+                return true;
+            }
         }
     }
 
+    slen = sizeof(remoteAddr);
+    recvfrom(sockFd, buf, sizeof(buf), 0, (struct sockaddr*)&remoteAddr, &slen);
     return false;
 }
 
@@ -330,6 +346,145 @@ static uint32_t p01dRxCount = 0;
 static uint64_t machinaSeq = 0;           // last packet number the bridge sent (lockstep)
 static float machinaSeqLo = -1.0f;
 static float machinaSeqHi = -1.0f;
+static float machinaTick[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
+
+// The run's packet form, set by its first packet: FW2's (numbered in 24-bit halves or not, a
+// fixed dt per step, MOTR replies, a sequence error ends the run with status 3) or the bridge's
+// (numbered in 16-bit words with the tick, the clock at each tick, MCH1 replies, a sequence error
+// latched in every later reply's flags, as w1-s7-inav-bridge's patches/0002 does).
+typedef enum {
+    MACHINA_FORM_UNKNOWN,
+    MACHINA_FORM_COUNTED,
+    MACHINA_FORM_TICKED,
+} machinaForm_e;
+
+#define MACHINA_FLAG_LOCKSTEP 0x01
+#define MACHINA_FLAG_SEQ_ERROR 0x02
+#define MACHINA_FLAG_FAILSAFE 0x04
+
+static machinaForm_e machinaForm = MACHINA_FORM_UNKNOWN;
+static uint64_t machinaLastTns = 0;
+static uint8_t machinaFlags = 0;
+
+/*
+ * The bridge's reply, MCH1 (w1-s7-inav-bridge: plugins/core_autopilot/inav/packets.py REPLY,
+ * "<4sIIQQBB8f3h3f3f3f3fIIIBBiii", little-endian and packed): the packets applied, the echoed
+ * number and tick of the last, the firmware clock (ns), every motor output, INAV's attitude,
+ * position and velocity estimates, its gyro and accelerometer as it reads them, its arming, mode,
+ * navigation and failsafe state, and its GNSS origin.
+ */
+static void sendMachinaReply(void)
+{
+    uint8_t b[160];
+    int o = 4;
+    uint32_t u;
+    uint64_t q;
+    float f;
+    int16_t s;
+    uint8_t n = getMotorCount();
+    uint8_t flags = machinaFlags;
+    memcpy(b, "MCH1", 4);
+#define MCH1_PUT(v) do { memcpy(b + o, &(v), sizeof(v)); o += sizeof(v); } while (0)
+    u = p01dRxCount; MCH1_PUT(u);
+    u = (uint32_t)machinaSeq; MCH1_PUT(u);
+    q = machinaLastTns; MCH1_PUT(q);
+    q = sitlLockstepEnabled() ? sitlLockstepNowNs() : (uint64_t)micros() * 1000ULL; MCH1_PUT(q);
+    if (sitlLockstepEnabled()) flags |= MACHINA_FLAG_LOCKSTEP;
+    if (failsafeIsActive() || FLIGHT_MODE(FAILSAFE_MODE)) flags |= MACHINA_FLAG_FAILSAFE;
+    MCH1_PUT(flags);
+    MCH1_PUT(n);
+    for (int i = 0; i < 8; i++) {
+        f = i < n ? PWM_TO_FLOAT_0_1(motor[i]) : 0.0f;
+        MCH1_PUT(f);
+    }
+    for (int i = 0; i < 3; i++) { s = attitude.raw[i]; MCH1_PUT(s); }
+    for (int i = 0; i < 3; i++) { f = getEstimatedActualPosition(i); MCH1_PUT(f); }
+    for (int i = 0; i < 3; i++) { f = getEstimatedActualVelocity(i); MCH1_PUT(f); }
+    for (int i = 0; i < 3; i++) { f = gyro.gyroADCf[i]; MCH1_PUT(f); }
+    for (int i = 0; i < 3; i++) { f = acc.accADCf[i]; MCH1_PUT(f); }
+    u = armingFlags; MCH1_PUT(u);
+    u = flightModeFlags; MCH1_PUT(u);
+    u = (uint32_t)NAV_Status.state; MCH1_PUT(u);
+    uint8_t phase = (uint8_t)failsafePhase(); MCH1_PUT(phase);
+    uint8_t ov = posControl.gpsOrigin.valid; MCH1_PUT(ov);
+    int32_t oi = posControl.gpsOrigin.lat; MCH1_PUT(oi);
+    oi = posControl.gpsOrigin.lon; MCH1_PUT(oi);
+    oi = posControl.gpsOrigin.alt; MCH1_PUT(oi);
+#undef MCH1_PUT
+    if (sendto(sockFd, (void*)b, o, 0, (struct sockaddr*)&serverAddr, serverAddrLen) < 0) {
+        connectionState = DISCONNECTED;
+    }
+}
+
+static void machinaSequenceError(const char *what, uint64_t seq, uint64_t tns)
+{
+    if (!(machinaFlags & MACHINA_FLAG_SEQ_ERROR)) {
+        fprintf(stderr, "[MACHINA] sequence error (%s): packet %llu (tick %llu ns) after %lu packets\n",
+                what, (unsigned long long)seq, (unsigned long long)tns, (unsigned long)p01dRxCount);
+        fflush(stderr);
+    }
+    machinaFlags |= MACHINA_FLAG_SEQ_ERROR;
+}
+
+/*
+ * After a packet is applied and before it is counted: its number (and, in the bridge's form, its
+ * tick) against the packets applied so far. Returns the packet's tick in the bridge's form, else 0.
+ * FW2's form: packet k numbered k (24-bit halves), or not numbered; in lockstep a gap, a repeat or
+ * a packet in the bridge's form stops the firmware (status 3). The bridge's form: packet k numbered
+ * k (16-bit words) at a tick after the last; any departure, a packet without its number or tick
+ * included, sets MACHINA_FLAG_SEQ_ERROR in this and every later reply.
+ */
+static uint64_t machinaNumbering(void)
+{
+    bool tickWords = false, allTickWords = true;
+    for (int i = 0; i < 4; i++) {
+        tickWords |= machinaTick[i] >= 0.0f;
+        allTickWords &= machinaTick[i] >= 0.0f;
+    }
+    const bool numbered = machinaSeqLo >= 0.0f && machinaSeqHi >= 0.0f;
+    if (machinaForm == MACHINA_FORM_UNKNOWN) {
+        machinaForm = tickWords ? MACHINA_FORM_TICKED : MACHINA_FORM_COUNTED;
+        if (machinaForm == MACHINA_FORM_TICKED && sitlLockstepEnabled()) {
+            sitlLockstepSetDelaysInstant(true);  // init runs at the first packet's tick
+        }
+    }
+
+    if (machinaForm == MACHINA_FORM_COUNTED) {
+        if (tickWords && sitlLockstepEnabled()) {
+            fprintf(stderr, "[SIM] X-Plane lockstep: packet %lu carries a tick in a run without them\n",
+                    (unsigned long)p01dRxCount);
+            fflush(stderr);
+            _exit(3);
+        }
+        if (numbered) {
+            const uint64_t seq = ((uint64_t)machinaSeqHi << 24) | (uint64_t)machinaSeqLo;
+            if (seq != p01dRxCount && sitlLockstepEnabled()) {
+                fprintf(stderr, "[SIM] X-Plane lockstep: sequence error: packet %llu, expected %lu\n",
+                        (unsigned long long)seq, (unsigned long)p01dRxCount);
+                fflush(stderr);
+                _exit(3);
+            }
+            machinaSeq = seq;
+        }
+        return 0;
+    }
+
+    const uint64_t seq = (numbered ? (uint64_t)machinaSeqLo : 0) | ((numbered ? (uint64_t)machinaSeqHi : 0) << 16);
+    uint64_t tns = 0;
+    for (int i = 0; i < 4; i++) {
+        tns |= (uint64_t)(machinaTick[i] >= 0.0f ? machinaTick[i] : 0.0f) << (16 * i);
+    }
+    if (!numbered || !allTickWords) {
+        machinaSequenceError("no number or no tick", seq, tns);
+    } else if (seq != p01dRxCount) {
+        machinaSequenceError(seq < p01dRxCount ? "a repeat" : "a gap", seq, tns);
+    } else if (p01dRxCount > 0 && tns <= machinaLastTns) {
+        machinaSequenceError("a tick that does not advance", seq, tns);
+    }
+    machinaSeq = seq;
+    machinaLastTns = tns;
+    return tns;
+}
 
 static void sendInavState(void)
 {
@@ -377,6 +532,10 @@ static void applyXPlanePacket(const uint8_t *buf, int recvLen);
 
 static void sendXPlaneOutputs(void)
 {
+    if (machinaForm == MACHINA_FORM_TICKED && sitlLockstepEnabled()) {
+        sendMachinaReply();  // the bridge's lockstep: the reply alone
+        return;
+    }
     float motorValue = 0;
     float yokeValues[3] = {0};
     int y = 0;
@@ -408,7 +567,11 @@ static void sendXPlaneOutputs(void)
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[2]", 0);
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[3]", 0);
     sendDref("sim/cockpit2/engine/actuators/cowl_flap_ratio[4]", 0);
-    sendInavState();
+    if (machinaForm == MACHINA_FORM_TICKED) {
+        sendMachinaReply();
+    } else {
+        sendInavState();
+    }
 }
 
 static void exchangeDataWithXPlane(void)
@@ -433,7 +596,12 @@ static void exchangeDataWithXPlane(void)
         return;
     }
 
+    machinaSeqLo = machinaSeqHi = -1.0f;
+    for (int i = 0; i < 4; i++) {
+        machinaTick[i] = -1.0f;
+    }
     applyXPlanePacket(buf, recvLen);
+    machinaNumbering();
     p01dRxCount++;
     unlockMainPID();
 }
@@ -616,6 +784,13 @@ static void applyXPlanePacket(const uint8_t *buf, int recvLen)
                 machinaSeqHi = value;
                 break;
 
+            case DREF_MACHINA_T0:
+            case DREF_MACHINA_T1:
+            case DREF_MACHINA_T2:
+            case DREF_MACHINA_T3:
+                machinaTick[dref - DREF_MACHINA_T0] = value;
+                break;
+
             default:
                 break;
         }
@@ -735,6 +910,9 @@ static void applyXPlanePacket(const uint8_t *buf, int recvLen)
  * included, is one step of dt (no connection probe consumes a packet); the reply (DREFs and MOTR)
  * follows the step. When the bridge numbers its packets (drefs DREF_MACHINA_SEQ_LO/HI), a gap or a
  * repeat stops the firmware: it prints the error and exits with status 3.
+ *
+ * A run whose packets carry their tick (the bridge's form, machinaNumbering) steps the clock to
+ * each packet's tick instead of by dt, never back, and answers with MCH1 alone.
  */
 static void lockstepXPlaneWorker(void)
 {
@@ -764,17 +942,11 @@ static void lockstepXPlaneWorker(void)
 
         sitlLockstepWaitParked();
         machinaSeqLo = machinaSeqHi = -1.0f;
-        applyXPlanePacket(buf, recvLen);
-        if (machinaSeqLo >= 0.0f && machinaSeqHi >= 0.0f) {
-            const uint64_t seq = ((uint64_t)machinaSeqHi << 24) | (uint64_t)machinaSeqLo;
-            if (seq != p01dRxCount) {
-                fprintf(stderr, "[SIM] X-Plane lockstep: sequence error: packet %llu, expected %lu\n",
-                        (unsigned long long)seq, (unsigned long)p01dRxCount);
-                fflush(stderr);
-                _exit(3);
-            }
-            machinaSeq = seq;
+        for (int i = 0; i < 4; i++) {
+            machinaTick[i] = -1.0f;
         }
+        applyXPlanePacket(buf, recvLen);
+        const uint64_t tickNs = machinaNumbering();
         if (connectionState != CONNECTED) {
             ENABLE_ARMING_FLAG(SIMULATOR_MODE_SITL);
             ENABLE_STATE(ACCELEROMETER_CALIBRATED);
@@ -782,7 +954,12 @@ static void lockstepXPlaneWorker(void)
         }
         p01dRxCount++;
         unlockMainPID();
-        sitlLockstepAdvanceTo(sitlLockstepNowNs() + sitlLockstepXplaneStepNs());
+        if (machinaForm == MACHINA_FORM_TICKED) {
+            const uint64_t nowNs = sitlLockstepNowNs();
+            sitlLockstepAdvanceTo(tickNs > nowNs ? tickNs : nowNs);  // sensors(k), the clock to tick k
+        } else {
+            sitlLockstepAdvanceTo(sitlLockstepNowNs() + sitlLockstepXplaneStepNs());
+        }
         sendXPlaneOutputs();
     }
 }
@@ -861,18 +1038,44 @@ bool simXPlaneInit(char* ip, int port, uint8_t* mapping, uint8_t mapCount,
         port = XP_PORT;  // use default port
     }
 
-    if (lookupAddress(ip, port, SOCK_DGRAM, (struct sockaddr*)&serverAddr, &serverAddrLen) != 0) {
-        return false;
-    }
-
-    sockFd = socket(((struct sockaddr*)&serverAddr)->sa_family, SOCK_DGRAM, IPPROTO_UDP);
-    if (sockFd < 0) {
-        return false;
+    if (strncmp(ip, "unix:", 5) == 0) {
+        // machina (the bridge's form): a datagram socket in a directory shared with the bridge, so
+        // the firmware's container needs no network; the bridge listens at <path>, the firmware
+        // at <path>.fw.
+        struct sockaddr_un *peer = (struct sockaddr_un *)&serverAddr;
+        struct sockaddr_un own;
+        memset(&serverAddr, 0, sizeof(serverAddr));
+        memset(&own, 0, sizeof(own));
+        peer->sun_family = AF_UNIX;
+        own.sun_family = AF_UNIX;
+        if (strlen(ip + 5) + 3 >= sizeof(own.sun_path)) {
+            fprintf(stderr, "[SOCKET] simulator socket path too long: %s\n", ip + 5);
+            return false;
+        }
+        snprintf(peer->sun_path, sizeof(peer->sun_path), "%s", ip + 5);
+        snprintf(own.sun_path, sizeof(own.sun_path), "%s.fw", ip + 5);
+        serverAddrLen = sizeof(struct sockaddr_un);
+        unlink(own.sun_path);
+        sockFd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (sockFd < 0 || bind(sockFd, (struct sockaddr *)&own, sizeof(own)) != 0) {
+            fprintf(stderr, "[SOCKET] cannot bind %s\n", own.sun_path);
+            return false;
+        }
+        fprintf(stderr, "[SOCKET] simulator socket %s, fd=%d\n", own.sun_path, sockFd);
     } else {
-        char addrbuf[IPADDRESS_PRINT_BUFLEN];
-        char* nptr = prettyPrintAddress((struct sockaddr*)&serverAddr, addrbuf, IPADDRESS_PRINT_BUFLEN);
-        if (nptr != NULL) {
-            fprintf(stderr, "[SOCKET] xplane address = %s, fd=%d\n", nptr, sockFd);
+        if (lookupAddress(ip, port, SOCK_DGRAM, (struct sockaddr*)&serverAddr, &serverAddrLen) != 0) {
+            return false;
+        }
+
+        sockFd = socket(((struct sockaddr*)&serverAddr)->sa_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (sockFd < 0) {
+            return false;
+        } else {
+            char addrbuf[IPADDRESS_PRINT_BUFLEN];
+            char* nptr = prettyPrintAddress((struct sockaddr*)&serverAddr, addrbuf, IPADDRESS_PRINT_BUFLEN);
+            if (nptr != NULL) {
+                fprintf(stderr, "[SOCKET] xplane address = %s, fd=%d\n", nptr, sockFd);
+            }
         }
     }
 
@@ -906,6 +1109,7 @@ bool simXPlaneInit(char* ip, int port, uint8_t* mapping, uint8_t mapCount,
 void simXPlaneClose(void)
 {
     connectionState = DISCONNECTED; // signal worker to exit its loop
+    shutdown(sockFd, SHUT_RDWR);    // unblock a receive with no timeout (lockstep)
     close(sockFd);                  // unblock any pending recvfrom
     if (listenThread) {
         pthread_join(listenThread, NULL);
