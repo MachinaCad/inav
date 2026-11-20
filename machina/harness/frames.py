@@ -330,8 +330,42 @@ def msp_v2_parse(buf: bytes) -> tuple[int, bytes, bytes] | None:
 
 XITL_VERSION = 2.0  # dref 0: >= 2 makes INAV read mag, battery, RSSI, sats and fix from us
 DREF_SEQ_LO, DREF_SEQ_HI = 42, 43  # this fork: the packet number in two 24-bit halves
+DREF_TICK = (44, 45, 46, 47)  # the bridge's form: the tick in four 16-bit words (and 42, 43 in 16)
 MOTR = struct.Struct("<5sIIB8f3h3f3fIIIB")  # patch 0001 (+ the lockstep byte of 0002)
 MOTR_EXT = struct.Struct("<QQ")  # this fork: the echoed packet number and the clock in ns
+MCH1 = struct.Struct("<4sIIQQBB8f3h3f3f3f3fIIIBBiii")  # the bridge's reply (w1-s7-inav-bridge)
+MCH1_LOCKSTEP, MCH1_SEQ_ERROR, MCH1_FAILSAFE = 0x01, 0x02, 0x04
+
+
+def bridge_number_drefs(seq: int, t_ns: int) -> dict[int, float]:
+    """The bridge's numbering (plugins/core_autopilot/inav/packets.py `number_drefs`): the packet
+    number in two 16-bit words (drefs 42, 43) and its tick in four (44 to 47)."""
+    d = {DREF_SEQ_LO: float(seq & 0xFFFF), DREF_SEQ_HI: float(seq >> 16)}
+    d.update({dref: float((t_ns >> (16 * i)) & 0xFFFF) for i, dref in enumerate(DREF_TICK)})
+    return d
+
+
+@dataclass
+class Mch1:
+    """The bridge's reply: packets applied, the last one's echoed number and tick, the clock (ns),
+    flags, motors (INAV's motor count), arming and mode flags, navigation state."""
+
+    rx: int
+    seq: int
+    t_ns: int
+    clock_ns: int
+    flags: int
+    motors: np.ndarray
+    arming: int
+    modes: int
+    nav_state: int
+
+
+def parse_mch1(buf: bytes) -> Mch1 | None:
+    if len(buf) < MCH1.size or buf[:4] != b"MCH1":
+        return None
+    f = MCH1.unpack_from(buf)
+    return Mch1(f[1], f[2], f[3], f[4], f[5], np.array(f[7 : 7 + min(f[6], 8)]), f[30], f[31], f[32])
 
 
 def rref_packet(values: dict[int, float]) -> bytes:

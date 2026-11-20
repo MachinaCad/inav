@@ -19,6 +19,7 @@ fast checks. The evidence (commit hashes, commands, results) is in machina's rep
 | `432581a00` | `MSP2_MACHINA_SIMULATOR`: machina's HITL frame | The firmware half of HITL on a real board, on the wall clock |
 | `b44a14bf2` | `machina_sim_unittest` (14 cases); ctest run from `build/src/test` | INAV's own unit-test framework for the frame codec (55 of 55 pass) |
 | the commit that adds this file | `machina/harness/`, `machina/tests/`, this README | The harness ported from the G0 probe, and the fast checks below |
+| `436b3da6e` | The X-Plane path in the bridge's form beside FW2's: `--simip=unix:<path>`, packets with their tick, `MCH1` replies, the clock at each tick, the first packet counted when paced | Machina's merged bridge (`w1-s7-inav-bridge`) speaks this form; with it the bridge runs this fork unchanged |
 
 `git log e519b69b0..machina-9.1.0` lists them all.
 
@@ -88,6 +89,19 @@ packets in drefs 42 and 43 (the low and high 24 bits, exact in float32): `MOTR` 
 clock in ns. The parser in `machina/harness/frames.py` reads both the 89-byte probe layout and the
 extended one.
 
+**The bridge's form.** Machina's merged bridge (`w1-s7-inav-bridge`, its `patches/0002`) launches
+`--sim=xp --simip=unix:<path> --lockstep` (paced: without `--lockstep`) and numbers every packet with
+its tick: drefs 42 and 43 carry the number in two 16-bit words and 44 to 47 the tick in integer ns
+in four. A run whose first packet carries a tick is in this form: packet k must be number k at a
+tick after the last, and a departure sets the sequence flag (0x02) in this and every later reply
+instead of stopping the firmware; the clock is set to each packet's tick (never back), and a delay
+takes no virtual time, so init runs whole at the first packet's tick; the reply is `MCH1`
+(`frames.MCH1`, 142 bytes: rx, the echoed number and tick, the clock, flags, motors, INAV's
+attitude, position and velocity, its gyro and accelerometer, arming, mode, navigation and failsafe
+state, the GNSS origin), alone in lockstep. The Unix socket (the bridge listens at `<path>`, the
+firmware binds `<path>.fw`) also works for FW2's form. Paced, the connection probe only peeks, so
+the first packet is applied and counted in both forms.
+
 ### HITL (`MSP2_MACHINA_SIMULATOR`, 0x2F01)
 
 The firmware half of hardware-in-the-loop on a real board, on the wall clock (the board's clock and
@@ -127,6 +141,7 @@ The fast checks (`machina/tests/`):
 | `test_determinism.py` | Three identical-seed flights side by side are bit-identical (every output frame and the trajectory); another seed differs |
 | `test_scenarios.py` | Hover (altitude within 0.2 m over 10 s), return-to-home (lands within 1 m), receiver loss enters INAV's failsafe, the X-Plane path hovers in lockstep |
 | `test_hitl.py` | HITL frames drive the board on its own clock with the sequence echoed; a gap, a frame without enable and a malformed frame each end simulator mode |
+| `test_bridge_form.py` | The bridge's form on its Unix socket: `MCH1` counts k + 1 packets, echoes number k and tick k, and the clock reads the tick, from reply 0 with four motors; a gap is flagged in that and every later reply; 65,600 packets pass 2^16 with no error; paced, the first packet is counted |
 
 ## The heading offset of the G0 probe
 
