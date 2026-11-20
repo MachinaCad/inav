@@ -133,6 +133,17 @@ def configure(eeprom: Path, cli: list[str] = CLI_QUAD, timeout: float = 60.0) ->
     return [line for o in out for line in o.splitlines() if "nvalid" in line or "rror" in line]
 
 
+def compass_calibration(site: plant.Site) -> list[str]:
+    """The compass gains INAV's own calibration would leave at ``site``: INAV scales each axis by
+    1024 / maggain and weights the compass by how close the field's magnitude comes to 1024 counts
+    (imu.c, MAX_MAG_NEARNESS), so an uncalibrated gain at a 25 uT site cuts the compass's weight to
+    e^-2. At 50 uT (1024 counts) the default gain is already right."""
+    gain = round(site.field_uT * 1e-6 / frames.MAG_T_PER_1024 * 1024)
+    if gain == 1024:
+        return []
+    return [f"set maggain_{axis} = {gain}" for axis in "xyz"]
+
+
 class FirmwareError(RuntimeError):
     """The firmware refused a frame, exited or stopped answering."""
 
@@ -260,7 +271,7 @@ def fly(
     own_eeprom = eeprom is None
     eeprom = eeprom or RUNS / f"{tag}.bin"
     if own_eeprom:
-        errors = configure(eeprom, cli)
+        errors = configure(eeprom, cli + compass_calibration(site or plant.Site()))
         if errors:
             raise RuntimeError(f"CLI errors: {errors}")
     period = Fraction(1_000_000_000) / Fraction(rate_hz)
