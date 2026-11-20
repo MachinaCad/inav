@@ -315,9 +315,12 @@ def fly(
                 quad.step(motors)
                 motors = out.motors[:4].copy()
             else:
-                while (rem := t_next - time.perf_counter()) > 0:
-                    if select.select([link.sock], [], [], rem)[0]:
-                        out = frames.decode_outputs(link.sock.recv(4096))
+                # Read every answer that has arrived, also when this send is already late (a
+                # sender behind its schedule must still see INAV's latest motors).
+                while select.select([link.sock], [], [], max(0.0, t_next - time.perf_counter()))[0]:
+                    out = frames.decode_outputs(link.sock.recv(4096))
+                    if out.is_error:
+                        raise FirmwareError(f"frame refused: {frames.ERRORS[out.error]}, expected seq {out.seq}")
                 checks["late_sends"] += time.perf_counter() - t_next > 0.010
                 link.send(frames.encode_sensors(s))
                 t_next += float(period) * 1e-9
