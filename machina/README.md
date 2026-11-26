@@ -171,27 +171,29 @@ medium or this written offer:
 > at no charge from the public repository of this fork. To ask for it, quote the binary's version
 > string (`INAV 9.1.0 SITL (<git revision>)`) or its `machina/<version>` tag.
 
-The public repository and the postal and email contact for requests are recorded when the fork is
-published under MachinaCad (see "Before a tag").
+The public repository is <https://github.com/MachinaCad/inav>, with `machina-9.1.0` as its
+default branch; requests go to an issue there, <https://github.com/MachinaCad/inav/issues>.
 
 ## Tags, and how machina's bridges take one
 
-A build is qualified for machina by a tag in this fork, `machina/<upstream tag>-m<n>`, for example
-`machina/9.1.0-m1`, on a commit of `machina-9.1.0` whose evidence is in machina's
-`docs/research/rig/firmware/inav-9.1.0.md`. A bridge pins the tag and the commit it points to:
+A release is a tag in this fork, `machina/<upstream tag>-m<n>`, on a commit of `machina-9.1.0`,
+and a tag never moves. Each tag starts as a candidate, and P1's criteria through the bridge qualify
+it (below). machina's `docs/research/rig/firmware/inav-9.1.0.md` records the evidence and the
+verdict, and a candidate that fails is followed by `-m<n+1>`. The first candidate is
+`machina/9.1.0-m1`, on `062ea6e02`, qualified at local scale on Nov 20. A bridge pins the tag and
+the commit it points to:
 `plugins/core_autopilot/inav/build.sh fork` clones the fork at the tag (instead of the G0 probe's
 clone of upstream plus patches), checks the commit hash, and builds with `machina/build.sh sitl`.
 The binary's version string carries the commit (`INAV 9.1.0 SITL (<hash>)`), and the hello frame
 carries it again, so a bridge can refuse a binary that is not the tagged build.
 
-## Before a tag
+## Before a candidate is qualified
 
 - P1's full criteria through `w1-s7-inav-bridge` once it merges: 1,000 runs per scenario, sequence
   integrity, exact sensor timing, and the pre-registered spread or bit-identical evidence.
 - machina's backend.py names INAV's convention `inav_xplane` only; the bridge needs the native
   convention (machina's frames go through unchanged, `enu_flu`) to use `--sim=machina`.
-- Publication under MachinaCad with CI (`machina/build.sh sitl` and `unit`, then the fast checks),
-  and the contact for source requests.
+- CI on the published fork (`machina/build.sh sitl` and `unit`, then the fast checks).
 - An ARM build of a real target (the HITL frame is compiled into every target with `USE_SIMULATOR`;
   only the SITL and unit-test builds are checked here) and the HITL checks on a board (FW5).
 - RPM filtering on simulated eRPM (D3): the frames carry no eRPM yet.
